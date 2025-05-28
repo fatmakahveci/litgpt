@@ -84,7 +84,7 @@ class GPT(nn.Module):
         self,
         idx: torch.Tensor,
         input_pos: Optional[torch.Tensor] = None,
-        input_pos_maxp1: Optional[torch.Tensor] = None,
+        input_pos_maxp1: Optional[int] = None,
         lm_head_chunk_size: int = 0,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
@@ -291,7 +291,7 @@ class Block(nn.Module):
         sin: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        input_pos_maxp1: Optional[torch.Tensor] = None,
+        input_pos_maxp1: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Non-parallel residual       Parallel residual
@@ -361,7 +361,7 @@ class CausalSelfAttention(nn.Module):
         sin: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        input_pos_maxp1: Optional[torch.Tensor] = None,
+        input_pos_maxp1: Optional[int] = None,
     ) -> torch.Tensor:
         # Notation:
         # - B          | batch size
@@ -516,10 +516,11 @@ class CausalSelfAttention(nn.Module):
 
 
 class GptNeoxMLP(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, intermediate_size: Optional[int] = None) -> None:
         super().__init__()
-        self.fc = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
+        self.intermediate_size = intermediate_size or config.intermediate_size
+        self.fc = nn.Linear(config.n_embd, self.intermediate_size, bias=config.bias)
+        self.proj = nn.Linear(self.intermediate_size, config.n_embd, bias=config.bias)
         self.config = config
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -529,11 +530,12 @@ class GptNeoxMLP(nn.Module):
 
 
 class LLaMAMLP(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, intermediate_size: Optional[int] = None) -> None:
         super().__init__()
-        self.fc_1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.fc_2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
+        self.intermediate_size = intermediate_size or config.intermediate_size
+        self.fc_1 = nn.Linear(config.n_embd, self.intermediate_size, bias=config.bias)
+        self.fc_2 = nn.Linear(config.n_embd, self.intermediate_size, bias=config.bias)
+        self.proj = nn.Linear(self.intermediate_size, config.n_embd, bias=config.bias)
         self.config = config
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -555,7 +557,9 @@ class LLaMAMoE(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
         self.gate = nn.Linear(config.n_embd, config.n_expert, bias=False)
-        self.experts = nn.ModuleList(LLaMAMLP(config) for _ in range(config.n_expert))
+        self.experts = nn.ModuleList(
+            LLaMAMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(config.n_expert)
+        )
         self.config = config
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -791,8 +795,10 @@ class KVCache(nn.Module):
 
         """
         # move the buffer to the activation dtype for when AMP is used
-        self.k = self.k.to(k.dtype)
-        self.v = self.v.to(v.dtype)
+        if self.k.dtype != k.dtype:
+            self.k = self.k.to(k.dtype)
+        if self.v.dtype != v.dtype:
+            self.v = self.v.to(v.dtype)
         # update the cache
         bs = k.size(0)
         k = batched_index_copy_(self.k[:bs, ...], -2, input_pos, k)
