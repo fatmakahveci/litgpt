@@ -77,7 +77,7 @@ def next_token(
     model: GPT,
     input_pos: torch.Tensor,
     x: torch.Tensor,
-    input_pos_maxp1: Optional[torch.Tensor] = None,
+    input_pos_maxp1: Optional[int] = None,
     **sample_kwargs: Dict[str, Any],
 ) -> torch.Tensor:
     logits = model(x, input_pos, input_pos_maxp1=input_pos_maxp1)
@@ -180,10 +180,7 @@ def generate_fn(
     input_pos = torch.arange(0, prompt_size, device=device, dtype=torch.int64)
     # input_pos_maxp1 introduces data-dependent shapes and control flow.
     # We want to skip if ThunderModules are involved, either directly or wrapped in LightningModule etc.
-    if not any(m.__class__.__name__ == "ThunderModule" for m in model.modules()):
-        input_pos_maxp1 = torch.tensor(prompt_size, device=device)
-    else:
-        input_pos_maxp1 = None
+    input_pos_maxp1 = prompt_size if all(m.__class__.__name__ != "ThunderModule" for m in model.modules()) else None
     for current_idx in range(max_returned_tokens - prompt_size):
         # Generate the token
         token = next_token(
@@ -231,7 +228,7 @@ def generate_fn(
         else:
             input_pos.add_(1)
         if input_pos_maxp1 is not None:
-            input_pos_maxp1.add_(1)
+            input_pos_maxp1 += 1
 
     # Yield any remaining tokens
     if yielded_idx < len(tokens):
@@ -435,6 +432,7 @@ def main(
     checkpoint_dir: Path,
     prompt: str = "What food do llamas eat?",
     *,
+    sys_prompt: Optional[str] = None,
     num_samples: int = 1,
     max_new_tokens: int = 50,
     top_k: Optional[int] = 50,
@@ -451,6 +449,7 @@ def main(
     Args:
         checkpoint_dir: The checkpoint directory to load.
         prompt: The prompt string to use for generating the samples.
+        sys_prompt: The system prompt to use for generating the samples.
         num_samples: The number of text samples to generate.
         max_new_tokens: The number of generation steps to take.
         top_k: The number of top most probable tokens to consider in the sampling process.
@@ -507,7 +506,7 @@ def main(
         load_prompt_style(checkpoint_dir) if has_prompt_style(checkpoint_dir) else PromptStyle.from_config(config)
     )
 
-    prompt = prompt_style.apply(prompt)
+    prompt = prompt_style.apply(prompt, sys_prompt=sys_prompt)
     encoded = tokenizer.encode(prompt, device=fabric.device)
     prompt_length = encoded.size(0)
     max_returned_tokens = prompt_length + max_new_tokens
