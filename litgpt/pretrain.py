@@ -3,6 +3,7 @@
 import math
 import pprint
 import time
+from dataclasses import asdict
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
@@ -18,7 +19,7 @@ from torchmetrics.aggregation import RunningMean
 from typing_extensions import Literal
 
 from litgpt import Tokenizer
-from litgpt.args import EvalArgs, TrainArgs
+from litgpt.args import EvalArgs, LogArgs, TrainArgs
 from litgpt.config import name_to_config
 from litgpt.data import DataModule, TinyLlama
 from litgpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP
@@ -62,6 +63,7 @@ def setup(
         tie_embeddings=False,
     ),
     eval: EvalArgs = EvalArgs(interval=1000, max_iters=100),
+    log: LogArgs = LogArgs(),
     optimizer: Union[str, Dict] = "AdamW",
     devices: Union[int, str] = "auto",
     num_nodes: int = 1,
@@ -127,7 +129,12 @@ def setup(
     tokenizer = Tokenizer(tokenizer_dir) if tokenizer_dir is not None else None
 
     logger = choose_logger(
-        logger_name, out_dir, name=f"pretrain-{config.name}", resume=bool(resume), log_interval=train.log_interval
+        logger_name,
+        out_dir,
+        name=f"pretrain-{config.name}",
+        resume=bool(resume),
+        log_interval=train.log_interval,
+        log_args=asdict(log),
     )
 
     if devices * num_nodes > 1:
@@ -228,6 +235,19 @@ def main(
         fabric.load(resume, state)
 
     train_time = time.perf_counter()
+
+    # work around PyTorch issue https://github.com/pytorch/pytorch/issues/152162
+    # which does not like the lazy initialization to be called in dynamo.
+    # Happens with PyTorch 2.7.
+    if (
+        torch.__version__.startswith("2.7.")
+        and (model._forward_module.__class__.__name__ == "OptimizedModule")
+        and (model._forward_module._orig_mod.__class__.__name__ == "FullyShardedDataParallel")
+    ):
+        from torch.distributed.fsdp._runtime_utils import _root_pre_forward
+
+        _root_pre_forward(model._forward_module._orig_mod, model._forward_module._orig_mod, [], {})
+
     fit(
         fabric=fabric,
         devices=devices,

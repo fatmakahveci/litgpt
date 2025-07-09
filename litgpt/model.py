@@ -84,7 +84,7 @@ class GPT(nn.Module):
         self,
         idx: torch.Tensor,
         input_pos: Optional[torch.Tensor] = None,
-        input_pos_maxp1: Optional[torch.Tensor] = None,
+        input_pos_maxp1: Optional[int] = None,
         lm_head_chunk_size: int = 0,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
@@ -271,12 +271,16 @@ class Block(nn.Module):
                 " (non-parallel residual and shared attention norm)."
             )
 
-        self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
+        self.norm_1 = nn.Identity() if not config.norm_1 else config.norm_class(config.n_embd, eps=config.norm_eps)
         self.attn = CausalSelfAttention(config, block_idx)
         self.post_attention_norm = (
             config.norm_class(config.n_embd, eps=config.norm_eps) if config.post_attention_norm else nn.Identity()
         )
-        self.norm_2 = None if config.shared_attention_norm else config.norm_class(config.n_embd, eps=config.norm_eps)
+        self.norm_2 = (
+            nn.Identity()
+            if not config.norm_2
+            else (None if config.shared_attention_norm else config.norm_class(config.n_embd, eps=config.norm_eps))
+        )
         self.mlp = config.mlp_class(config)
         self.post_mlp_norm = (
             config.norm_class(config.n_embd, eps=config.norm_eps) if config.post_mlp_norm else nn.Identity()
@@ -291,7 +295,7 @@ class Block(nn.Module):
         sin: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        input_pos_maxp1: Optional[torch.Tensor] = None,
+        input_pos_maxp1: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Non-parallel residual       Parallel residual
@@ -325,6 +329,7 @@ class Block(nn.Module):
         else:
             x = attention_output + x
             x_normed = self.norm_2(x)
+
         return self.post_mlp_norm(self.mlp(x_normed)) + x
 
 
@@ -346,8 +351,12 @@ class CausalSelfAttention(nn.Module):
             self.apply_sliding_window_attention = config.sliding_window_indices[block_idx]
 
         if config.norm_qk:
-            self.norm_q = config.norm_class(config.head_size, eps=config.norm_eps)
-            self.norm_k = config.norm_class(config.head_size, eps=config.norm_eps)
+            norm_q_size = config.n_head * config.head_size if config.norm_qk_type == "olmo2" else config.head_size
+            norm_k_size = (
+                config.n_query_groups * config.head_size if config.norm_qk_type == "olmo2" else config.head_size
+            )
+            self.norm_q = config.norm_class(norm_q_size, eps=config.norm_eps)
+            self.norm_k = config.norm_class(norm_k_size, eps=config.norm_eps)
         else:
             self.norm_q = self.norm_k = None
 
@@ -361,15 +370,33 @@ class CausalSelfAttention(nn.Module):
         sin: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        input_pos_maxp1: Optional[torch.Tensor] = None,
+        input_pos_maxp1: Optional[int] = None,
     ) -> torch.Tensor:
         # Notation:
         # - B          | batch size
         # - T          | time-step (sequence length)
         # - C          | model's embeddings size (n_embd)
         # - C*         | attentions's embeddings size
-        # - nh_(q,k,v) | number of heads for query, key and value
         # - hs         | head size
+        # - nh_(q,k,v) | number of heads for query, key and value
+        # - n_query_groups = nh_k = nh_v | number of query groups sharing key and value heads
+        # alternative notation: num_kv_groups = n_query_groups
+        # ┌───┐┌───┐┌───┐┌───┐     ┌───┐    ┌───┐             ┌───┐
+        # │ v ││ v ││ v ││ v │     │ v │    │ v │             │ v │
+        # └───┘└───┘└───┘└───┘     └───┘    └───┘             └───┘
+        #   │    │    │    │         │        │                 │
+        # ┌───┐┌───┐┌───┐┌───┐     ┌───┐    ┌───┐             ┌───┐
+        # │ k ││ k ││ k ││ k │     │ k │    │ k │             │ k │
+        # └───┘└───┘└───┘└───┘     └───┘    └───┘             └───┘
+        #   │    │    │    │      ┌──┴──┐  ┌──┴──┐      ┌────┬──┴─┬────┐
+        # ┌───┐┌───┐┌───┐┌───┐  ┌───┐┌───┐┌───┐┌───┐  ┌───┐┌───┐┌───┐┌───┐
+        # │ q ││ q ││ q ││ q │  │ q ││ q ││ q ││ q │  │ q ││ q ││ q ││ q │
+        # └───┘└───┘└───┘└───┘  └───┘└───┘└───┘└───┘  └───┘└───┘└───┘└───┘
+        # ◀──────────────────▶  ◀──────────────────▶  ◀──────────────────▶
+        #         MHA                    GQA                   MQA
+        #   n_query_groups=4       n_query_groups=2      n_query_groups=1
+        #
+        # credit https://arxiv.org/pdf/2305.13245.pdf
         head_size = self.config.head_size
         n_head = self.config.n_head
         n_query_groups = self.config.n_query_groups
@@ -381,17 +408,24 @@ class CausalSelfAttention(nn.Module):
         qkv = self.qkv(x)  # (B, T, 3xC*)
 
         # Define query, key and value sizes.
-        # If grouped/multi query is enabled, these sizes are not equal (see the diagram in `lit_gpt/config.py::Config`).
+        # If grouped/multi query is enabled, these sizes are not equal (see the diagram above).
         query_size = n_head * head_size
         key_size = value_size = n_query_groups * head_size
         # Split qkv into query, key and value matrices.
         q, k, v = qkv.split((query_size, key_size, value_size), dim=-1)  # 3x(B, T, C*)
 
+        if self.config.norm_qk and self.config.norm_qk_type == "olmo2":
+            q = self.norm_q(q)
+            k = self.norm_k(k)
+
         # To place the num_heads (nh) dimension right after the batch (B) dimension, the first step is to decouple the
         # embedding size (C) into num_heads (nh) and head_size (hs).
+
+        # The original GQA paper is followed here and the term query groups is used.
+        # alternative notation: Query groups are also referred to as KV groups.
         q = q.view(B, T, n_head, head_size)  # (B, T, nh_q, hs)
-        k = k.view(B, T, n_query_groups, head_size)  # (B, T, nh_k, hs)
-        v = v.view(B, T, n_query_groups, head_size)  # (B, T, nh_v, hs)
+        k = k.view(B, T, n_query_groups, head_size)  # (B, T, n_query_groups, hs)
+        v = v.view(B, T, n_query_groups, head_size)  # (B, T, n_query_groups, hs)
 
         # The tensors `query`, `key`, and `value` are now accurately structured: within each batch element (B), there are
         # multiple heads (nh), and within each head, there is a sequence of elements (T), each represented by a vector
@@ -400,7 +434,7 @@ class CausalSelfAttention(nn.Module):
         k = k.transpose(1, 2)  # (B, nh_k, T, hs)
         v = v.transpose(1, 2)  # (B, nh_v, T, hs)
 
-        if self.config.norm_qk:
+        if self.config.norm_qk and self.config.norm_qk_type == "default":
             q = self.norm_q(q)
             k = self.norm_k(k)
 
@@ -516,10 +550,11 @@ class CausalSelfAttention(nn.Module):
 
 
 class GptNeoxMLP(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, intermediate_size: Optional[int] = None) -> None:
         super().__init__()
-        self.fc = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
+        self.intermediate_size = intermediate_size or config.intermediate_size
+        self.fc = nn.Linear(config.n_embd, self.intermediate_size, bias=config.bias)
+        self.proj = nn.Linear(self.intermediate_size, config.n_embd, bias=config.bias)
         self.config = config
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -529,11 +564,12 @@ class GptNeoxMLP(nn.Module):
 
 
 class LLaMAMLP(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, intermediate_size: Optional[int] = None) -> None:
         super().__init__()
-        self.fc_1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.fc_2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
+        self.intermediate_size = intermediate_size or config.intermediate_size
+        self.fc_1 = nn.Linear(config.n_embd, self.intermediate_size, bias=config.bias)
+        self.fc_2 = nn.Linear(config.n_embd, self.intermediate_size, bias=config.bias)
+        self.proj = nn.Linear(self.intermediate_size, config.n_embd, bias=config.bias)
         self.config = config
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -555,7 +591,9 @@ class LLaMAMoE(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
         self.gate = nn.Linear(config.n_embd, config.n_expert, bias=False)
-        self.experts = nn.ModuleList(LLaMAMLP(config) for _ in range(config.n_expert))
+        self.experts = nn.ModuleList(
+            LLaMAMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(config.n_expert)
+        )
         self.config = config
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -791,8 +829,10 @@ class KVCache(nn.Module):
 
         """
         # move the buffer to the activation dtype for when AMP is used
-        self.k = self.k.to(k.dtype)
-        self.v = self.v.to(v.dtype)
+        if self.k.dtype != k.dtype:
+            self.k = self.k.to(k.dtype)
+        if self.v.dtype != v.dtype:
+            self.v = self.v.to(v.dtype)
         # update the cache
         bs = k.size(0)
         k = batched_index_copy_(self.k[:bs, ...], -2, input_pos, k)

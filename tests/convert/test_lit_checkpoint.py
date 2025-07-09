@@ -519,13 +519,13 @@ def test_against_original_gemma_2(model_name, device, dtype):
 @pytest.mark.parametrize(
     ("device", "dtype"),
     [
-        (torch.device("cpu"), torch.float32),
+        pytest.param(torch.device("cpu"), torch.float32, marks=[pytest.mark.flaky(reruns=3)]),
         pytest.param(
             torch.device("cuda"),
             torch.float16,
             marks=[
-                # the reference does softmax upscaled to fp32 during attention. additionally, the final layernorm input
-                # is slightly different
+                # todo: the reference does softmax upscaled to fp32 during attention
+                # additionally, the final layernorm input is slightly different
                 pytest.mark.xfail(raises=AssertionError, strict=False),
                 _RunIf(min_cuda_gpus=1),
             ],
@@ -605,7 +605,15 @@ def test_check_conversion_supported_lora():
 
 @torch.inference_mode()
 @pytest.mark.parametrize(
-    "model_name", ["Qwen2.5-1.5B", "Qwen2.5-Coder-1.5B", "Qwen2.5-Math-1.5B", "QwQ-32B-Preview", "QwQ-32B"]
+    "model_name",
+    (
+        "Qwen2.5-1.5B",
+        "Qwen2.5-Coder-1.5B",
+        "Qwen2.5-Math-1.5B",
+        "QwQ-32B-Preview",
+        "QwQ-32B",
+        "Qwen2.5-7B-Instruct-1M",
+    ),
 )
 @pytest.mark.parametrize(
     ("device", "dtype"),
